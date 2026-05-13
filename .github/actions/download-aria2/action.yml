@@ -1,0 +1,105 @@
+name: 'Download with aria2'
+description: 'Downloads files using aria2c with curl fallback and retry logic'
+
+inputs:
+  urls:
+    description: 'Space-separated list of URLs to download'
+    required: true
+  dest_dir:
+    description: 'Destination directory for downloads'
+    required: false
+    default: 'tmp_downloads'
+  max_retries:
+    description: 'Maximum retry attempts per file'
+    required: false
+    default: '3'
+  retry_delay:
+    description: 'Initial delay between retries (seconds)'
+    required: false
+    default: '5'
+  backup_dir:
+    description: 'Backup directory path'
+    required: true
+  split_threshold_mb:
+    description: 'File size threshold for splitting (MB)'
+    required: false
+    default: '45'
+
+outputs:
+  downloaded_files:
+    description: 'List of downloaded files (one per line)'
+    value: ${{ steps.download.outputs.downloaded_files }}
+  has_files:
+    description: 'Whether any files were downloaded'
+    value: ${{ steps.download.outputs.has_files }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install aria2
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aria2
+
+    - name: Download files
+      id: download
+      shell: bash
+      env:
+        INPUT_URLS: ${{ inputs.urls }}
+        INPUT_DEST_DIR: ${{ inputs.dest_dir }}
+        INPUT_MAX_RETRIES: ${{ inputs.max_retries }}
+        INPUT_RETRY_DELAY: ${{ inputs.retry_delay }}
+        INPUT_BACKUP_DIR: ${{ inputs.backup_dir }}
+        INPUT_SPLIT_THRESHOLD_MB: ${{ inputs.split_threshold_mb }}
+      run: |
+        # Source utility scripts
+        SCRIPT_DIR="${{ github.action_path }}/scripts"
+        source "${{ github.workspace }}/.github/scripts/utils/random-name.sh"
+        source "${{ github.workspace }}/.github/scripts/download/retry-download.sh"
+        source "${{ github.workspace }}/.github/scripts/download/validate-file.sh"
+        
+        DEST_DIR="${{ inputs.dest_dir }}"
+        BACKUP_DIR="${{ inputs.backup_dir }}"
+        mkdir -p "$DEST_DIR"
+        
+        URLS="${{ inputs.urls }}"
+        DOWNLOADED_LIST=""
+        
+        for URL in $URLS; do
+          # Extract and sanitize filename from URL
+          FILENAME=$(basename "$URL" | sed 's/%20/ /g' | sed 's/%2F/-/g' | sed 's/[?#].*//')
+          FILENAME=$(echo "$FILENAME" | sed 's/[<>:"|?*]/_/g')
+          
+          echo "Downloading $URL -> $FILENAME"
+          
+          if download_with_retry \
+              "$URL" \
+              "$FILENAME" \
+              "$DEST_DIR" \
+              "${{ inputs.max_retries }}" \
+              "${{ inputs.retry_delay }}"; then
+            DOWNLOADED_LIST="${DOWNLOADED_LIST}${FILENAME}"$'\n'
+          else
+            echo "Failed to download: $FILENAME"
+            # Create error README
+            BASENAME_NO_EXT="${FILENAME%.*}"
+            FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BACKUP_DIR" "$BASENAME_NO_EXT")
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            # Use readme-generator for error file (handled by main workflow)
+            echo "ERROR_FOLDER:$FOLDER_NAME:$FILENAME:$URL" >> /tmp/error_files.txt
+          fi
+        done
+        
+        # Output list of successfully downloaded files
+        {
+          echo "downloaded_files<<EOF"
+          echo "$DOWNLOADED_LIST"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+        
+        if [ -n "$(ls -A "$DEST_DIR" 2>/dev/null)" ]; then
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_files=false" >> "$GITHUB_OUTPUT"
+        fi

@@ -1,0 +1,145 @@
+name: 'Zip Handler'
+description: 'Handles zip creation for single files and split archives'
+
+inputs:
+  mode:
+    description: 'Processing mode: "single" or "split" or "archive"'
+    required: true
+  source_dir:
+    description: 'Directory containing source files'
+    required: true
+  backup_dir:
+    description: 'Backup directory for output'
+    required: true
+  password:
+    description: 'Optional password for zip files'
+    required: false
+    default: ''
+  split_threshold_mb:
+    description: 'File size threshold for splitting (MB)'
+    required: false
+    default: '45'
+  repo_owner:
+    description: 'Repository owner'
+    required: true
+  repo_name:
+    description: 'Repository name'
+    required: true
+  branch:
+    description: 'Current branch name'
+    required: true
+
+outputs:
+  processed_folders:
+    description: 'List of processed folder names'
+    value: ${{ steps.process.outputs.processed_folders }}
+
+runs:
+  using: composite
+  steps:
+    - name: Process files
+      id: process
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_SOURCE_DIR: ${{ inputs.source_dir }}
+        INPUT_BACKUP_DIR: ${{ inputs.backup_dir }}
+        INPUT_PASSWORD: ${{ inputs.password }}
+        INPUT_SPLIT_THRESHOLD_MB: ${{ inputs.split_threshold_mb }}
+        INPUT_REPO_OWNER: ${{ inputs.repo_owner }}
+        INPUT_REPO_NAME: ${{ inputs.repo_name }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+      run: |
+        source "${{ github.workspace }}/.github/scripts/utils/random-name.sh"
+        
+        SOURCE_DIR="${{ inputs.source_dir }}"
+        BACKUP_DIR="${{ inputs.backup_dir }}"
+        PASSWORD="${{ inputs.password }}"
+        SPLIT_THRESHOLD_MB="${{ inputs.split_threshold_mb }}"
+        SPLIT_THRESHOLD_BYTES=$((SPLIT_THRESHOLD_MB * 1024 * 1024))
+        MODE="${{ inputs.mode }}"
+        
+        urlencode() {
+          python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+        }
+        
+        PROCESSED_LIST=""
+        
+        if [ "$MODE" = "archive" ]; then
+          # Archive mode: zip all files in source dir into one archive
+          if [ -n "$(ls -A "$SOURCE_DIR" 2>/dev/null)" ]; then
+            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S)"
+            FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BACKUP_DIR" "$ARCHIVE_NAME")
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            
+            VALID_FILES=$(find "$SOURCE_DIR" -type f -size +0c 2>/dev/null | tr '\n' ' ')
+            
+            if [ -n "$VALID_FILES" ]; then
+              if [ -n "$PASSWORD" ]; then
+                zip -j -P "$PASSWORD" "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" $VALID_FILES
+              else
+                zip -j "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" $VALID_FILES
+              fi
+              
+              if [ -s "$BACKUP_DIR/$FOLDER_NAME/${ARCHIVE_NAME}.zip" ]; then
+                PROCESSED_LIST="${FOLDER_NAME}"$'\n'
+                echo "Created archive: $FOLDER_NAME"
+              fi
+            fi
+          fi
+        else
+          # Single or split mode for each file
+          for FILE in "$SOURCE_DIR"/*; do
+            [ -f "$FILE" ] || continue
+            [ -s "$FILE" ] || continue
+            
+            SIZE=$(stat -c%s "$FILE")
+            [ "$SIZE" -gt 0 ] || continue
+            
+            BASENAME=$(basename "$FILE")
+            BASENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            
+            FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BACKUP_DIR" "$BASENAME_NO_EXT")
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            
+            if [ "$MODE" = "split" ] && [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+              # Split mode for large files
+              TEMP_NAME="file_$$"
+              cp "$FILE" "$SOURCE_DIR/${TEMP_NAME}.${EXT}"
+              
+              cd "$SOURCE_DIR"
+              if [ -n "$PASSWORD" ]; then
+                zip -0 -s "${SPLIT_THRESHOLD_MB}m" -P "$PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              else
+                zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              fi
+              
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ] && [ -s "$part" ]; then
+                  PART_EXT="${part##*.}"
+                  mv "$part" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.${PART_EXT}"
+                fi
+              done
+              
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd - > /dev/null
+            else
+              # Single zip mode
+              if [ -n "$PASSWORD" ]; then
+                zip -j -P "$PASSWORD" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+              else
+                zip -j "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+              fi
+            fi
+            
+            PROCESSED_LIST="${PROCESSED_LIST}${FOLDER_NAME}"$'\n'
+          done
+        fi
+        
+        # Output processed folders
+        {
+          echo "processed_folders<<EOF"
+          echo "$PROCESSED_LIST"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"

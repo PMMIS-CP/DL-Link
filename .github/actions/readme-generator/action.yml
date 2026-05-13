@@ -1,0 +1,267 @@
+name: 'README Generator'
+description: 'Generates README.md files for downloaded content'
+
+inputs:
+  action:
+    description: 'Action to perform: single, split, archive, error, index, or root'
+    required: true
+  folder_name:
+    description: 'Name of the download folder'
+    required: false
+    default: ''
+  backup_dir:
+    description: 'Backup directory path'
+    required: true
+  params:
+    description: 'Additional parameters as key=value pairs (pipe or space separated)'
+    required: false
+    default: ''
+
+outputs:
+  readme_path:
+    description: 'Path to generated README'
+    value: ${{ steps.generate.outputs.readme_path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Generate README
+      id: generate
+      shell: bash
+      env:
+        INPUT_ACTION: ${{ inputs.action }}
+        INPUT_FOLDER_NAME: ${{ inputs.folder_name }}
+        INPUT_BACKUP_DIR: ${{ inputs.backup_dir }}
+        INPUT_PARAMS: ${{ inputs.params }}
+      run: |
+        BACKUP_DIR="${{ inputs.backup_dir }}"
+        FOLDER_NAME="${{ inputs.folder_name }}"
+        ACTION="${{ inputs.action }}"
+        
+        # Parse params
+        declare -A PARAMS
+        for pair in ${{ inputs.params }}; do
+          key="${pair%%=*}"
+          value="${pair#*=}"
+          PARAMS["$key"]="$value"
+        done
+        
+        urlencode() {
+          python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+        }
+        
+        case "$ACTION" in
+          error)
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            README_PATH="$BACKUP_DIR/$FOLDER_NAME/README.md"
+            {
+              echo "# ${PARAMS[filename]} - Download Failed"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **File** | \`${PARAMS[filename]}\` |"
+              echo "| **URL** | ${PARAMS[url]} |"
+              echo "| **Date** | $(date '+%Y-%m-%d %H:%M:%S UTC') |"
+              echo "| **Status** | **FAILED** |"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Error Details"
+              echo ""
+              echo "\`\`\`"
+              echo "${PARAMS[error_msg]}"
+              echo "\`\`\`"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Possible Solutions"
+              echo ""
+              echo "- Check if the URL is correct and accessible"
+              echo "- The file may have been removed or moved"
+              echo "- The server may require authentication"
+              echo "- For SourceForge: Try using the direct download link"
+              echo "- Some servers block automated downloads (403 Forbidden)"
+              echo "- Try again later if it is a temporary server issue"
+            } > "$README_PATH"
+            ;;
+            
+          single)
+            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+            FILE_ENCODED=$(urlencode "${FOLDER_NAME}.zip")
+            RAW_LINK="https://github.com/${PARAMS[repo_owner]}/${PARAMS[repo_name]}/raw/${PARAMS[branch]}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
+            
+            README_PATH="$BACKUP_DIR/$FOLDER_NAME/README.md"
+            {
+              echo "# ${PARAMS[basename_no_ext]}"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **Original File** | \`${PARAMS[basename]}\` |"
+              echo "| **Size** | ${PARAMS[size_mb]} MB |"
+              echo "| **Status** | **Complete (100%)** |"
+              if [ -n "${PARAMS[password]}" ]; then
+                echo "| **Password Protected** | **YES** |"
+              else
+                echo "| **Password Protected** | **NO** |"
+              fi
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Link"
+              echo ""
+              echo "| File | Link |"
+              echo "|------|------|"
+              echo "| \`${FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |"
+            } > "$README_PATH"
+            ;;
+            
+          split)
+            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+            PARTS_COUNT=${PARAMS[parts_count]:-0}
+            TOTAL_SIZE_MB=${PARAMS[total_size_mb]:-0}
+            BASENAME_NO_EXT=${PARAMS[basename_no_ext]:-''}
+            BASENAME=${PARAMS[basename]:-''}
+            
+            # Build download links for all parts
+            DOWNLOAD_LINKS_MD=""
+            LINK_NUM=0
+            for part_file in "$BACKUP_DIR/$FOLDER_NAME/"*.z*; do
+              if [ -f "$part_file" ]; then
+                PART_BASENAME=$(basename "$part_file")
+                PART_ENCODED=$(urlencode "$PART_BASENAME")
+                RAW_LINK="https://github.com/${PARAMS[repo_owner]}/${PARAMS[repo_name]}/raw/${PARAMS[branch]}/downloads/${FOLDER_ENCODED}/${PART_ENCODED}"
+                LINK_NUM=$((LINK_NUM + 1))
+                DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+              fi
+            done
+            
+            README_PATH="$BACKUP_DIR/$FOLDER_NAME/README.md"
+            {
+              printf '%s\n' "# ${BASENAME_NO_EXT}"
+              printf '%s\n' ""
+              printf '%s\n' "---"
+              printf '%s\n' ""
+              printf '%s\n' "## Download Information"
+              printf '%s\n' ""
+              printf '%s\n' "| Property | Value |"
+              printf '%s\n' "|----------|-------|"
+              printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
+              printf '%s\n' "| **Total Size** | **${PARTS_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
+              printf '%s\n' "| **Status** | **Complete (100%)** |"
+              if [ -n "${PARAMS[password]}" ]; then
+                printf '%s\n' "| **Password Protected** | **YES** |"
+              else
+                printf '%s\n' "| **Password Protected** | **NO** |"
+              fi
+              printf '%s\n' ""
+              printf '%s\n' "---"
+              printf '%s\n' ""
+              printf '%s\n' "## Download Links"
+              printf '%s\n' ""
+              printf '%s\n' "| # | File | Link |"
+              printf '%s\n' "|---|------|------|"
+              printf '%s' "${DOWNLOAD_LINKS_MD}"
+              printf '%s\n' ""
+              printf '%s\n' "---"
+              printf '%s\n' ""
+              printf '%s\n' "## How to Extract"
+              printf '%s\n' ""
+              printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+              printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+              printf '%s\n' "3. Open the \`.zip\` file - all parts will combine automatically"
+            } > "$README_PATH"
+            ;;
+            
+          archive)
+            FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+            FILE_ENCODED=$(urlencode "${PARAMS[archive_name]}.zip")
+            RAW_LINK="https://github.com/${PARAMS[repo_owner]}/${PARAMS[repo_name]}/raw/${PARAMS[branch]}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
+            
+            README_PATH="$BACKUP_DIR/$FOLDER_NAME/README.md"
+            {
+              echo "# ${PARAMS[archive_name]} Archive"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Information"
+              echo ""
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **Archive Name** | \`${PARAMS[archive_name]}.zip\` |"
+              echo "| **Size** | ${PARAMS[size_mb]} MB |"
+              echo "| **Status** | **Complete (100%)** |"
+              if [ -n "${PARAMS[password]}" ]; then
+                echo "| **Password Protected** | **YES** |"
+              else
+                echo "| **Password Protected** | **NO** |"
+              fi
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Download Link"
+              echo ""
+              echo "| File | Link |"
+              echo "|------|------|"
+              echo "| \`${PARAMS[archive_name]}.zip\` | [Download](${RAW_LINK}) |"
+            } > "$README_PATH"
+            ;;
+            
+          index)
+            README_PATH="$BACKUP_DIR/README.md"
+            {
+              echo "# Downloaded list :"
+              echo ""
+              for folder in "$BACKUP_DIR"/*/; do
+                [ -d "$folder" ] || continue
+                FOLDER_BASENAME=$(basename "$folder")
+                FOLDER_ENCODED=$(urlencode "$FOLDER_BASENAME")
+                echo "- [${FOLDER_BASENAME}](./${FOLDER_ENCODED})"
+              done
+            } > "$README_PATH"
+            ;;
+            
+          root)
+            REPO_URL="${PARAMS[repo_url]}"
+            README_PATH="${{ github.workspace }}/README.md"
+            SECTION_TITLE="Downloaded files in your GitHub :"
+            
+            if [ ! -f "$README_PATH" ]; then
+              echo "# Downloader" > "$README_PATH"
+              echo "" >> "$README_PATH"
+            fi
+            
+            # Remove old section if exists
+            if grep -q "$SECTION_TITLE" "$README_PATH" 2>/dev/null; then
+              sed -i "/$SECTION_TITLE/,/^---$/d" "$README_PATH"
+              sed -i '${/^$/d;}' "$README_PATH"
+            fi
+            
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "## $SECTION_TITLE"
+              echo ""
+              COUNTER=1
+              for folder in "$BACKUP_DIR"/*/; do
+                [ -d "$folder" ] || continue
+                FOLDER_BASENAME=$(basename "$folder")
+                FOLDER_ENCODED=$(urlencode "$FOLDER_BASENAME")
+                echo "${COUNTER}. [${FOLDER_BASENAME}](${REPO_URL}/${FOLDER_ENCODED})"
+                echo ""
+                COUNTER=$((COUNTER + 1))
+              done
+              echo "---"
+            } >> "$README_PATH"
+            ;;
+        esac
+        
+        echo "readme_path=$README_PATH" >> "$GITHUB_OUTPUT"

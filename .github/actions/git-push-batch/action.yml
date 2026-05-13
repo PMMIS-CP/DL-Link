@@ -1,0 +1,32 @@
+name: 'Git Push Batch'
+description: 'Pushes files in small batches with retry logic for large repositories'
+
+inputs:
+  backup_dir:
+    description: 'Directory containing files to push'
+    required: true
+  branch:
+    description: 'Target branch'
+    required: false
+    default: '${{ github.ref_name }}'
+  batch_size:
+    description: 'Number of files per batch'
+    required: false
+    default: '3'
+  max_push_retries:
+    description: 'Max push retries per batch'
+    required: false
+    default: '5'
+
+runs:
+  using: composite
+  steps:
+    - name: Push files incrementally
+      shell: bash
+      env:
+        INPUT_BACKUP_DIR: ${{ inputs.backup_dir }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_BATCH_SIZE: ${{ inputs.batch_size }}
+        INPUT_MAX_PUSH_RETRIES: ${{ inputs.max_push_retries }}
+      run: |
+        exec "${{ github.action_path }}/scripts/push.sh"

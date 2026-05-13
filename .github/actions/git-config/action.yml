@@ -1,0 +1,36 @@
+name: 'Git Configuration'
+description: 'Configures Git for large file handling and sets user identity'
+
+inputs:
+  user_name:
+    description: 'Git user name'
+    required: false
+    default: 'github-actions'
+  user_email:
+    description: 'Git user email'
+    required: false
+    default: 'github-actions@github.com'
+  large_file_config:
+    description: 'Whether to apply large file optimizations'
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Configure Git
+      shell: bash
+      run: |
+        if [ "${{ inputs.large_file_config }}" = "true" ]; then
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          echo "Git configured for large file handling"
+        fi
+        
+        git config user.name "${{ inputs.user_name }}"
+        git config user.email "${{ inputs.user_email }}"
+        echo "Git user configured: ${{ inputs.user_name }} <${{ inputs.user_email }}>"

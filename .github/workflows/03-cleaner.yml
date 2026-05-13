@@ -1,5 +1,4 @@
----
-name: 🗑 3-Clean downloads folder
+name: 3-Clean downloads folder
 
 on:
   workflow_dispatch:
