@@ -29,4 +29,4 @@ runs:
         INPUT_BATCH_SIZE: ${{ inputs.batch_size }}
         INPUT_MAX_PUSH_RETRIES: ${{ inputs.max_push_retries }}
       run: |
-        exec "${{ github.action_path }}/scripts/push.sh"
+        bash "${{ github.action_path }}/scripts/push.sh"
