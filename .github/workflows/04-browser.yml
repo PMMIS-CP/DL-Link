@@ -59,105 +59,11 @@ jobs:
           mkdir -p downloads
 
       # ============================================================
-      # STEP 1: Browser Navigator - Extract links first
+      # STEP 1: Browser Direct Download (Primary - like old version)
       # ============================================================
-      - name: Navigate and extract links via browser
-        id: browser_navigate
-        uses: ./.github/actions/browser-download
-        with:
-          url: ${{ github.event.inputs.url }}
-          mode: extract
-
-      - name: Show extracted links
-        run: |
-          echo "=========================================="
-          echo "Browser Navigator Results:"
-          echo "=========================================="
-          echo "Direct URLs found: ${{ steps.browser_navigate.outputs.has_direct_urls }}"
-          if [ "${{ steps.browser_navigate.outputs.has_direct_urls }}" = "true" ]; then
-            echo ""
-            echo "Direct download links:"
-            echo "${{ steps.browser_navigate.outputs.direct_urls }}"
-          fi
-          echo ""
-          echo "All candidate URLs:"
-          echo "${{ steps.browser_navigate.outputs.all_urls }}"
-
-      # ============================================================
-      # STEP 2: Filter URLs - separate direct URLs from complex ones
-      # ============================================================
-      - name: Filter and categorize URLs
-        id: filter_urls
-        if: steps.browser_navigate.outputs.has_direct_urls == 'true' || steps.browser_navigate.outputs.all_urls != ''
-        run: |
-          DIRECT_URLS="${{ steps.browser_navigate.outputs.direct_urls }}"
-          ALL_URLS="${{ steps.browser_navigate.outputs.all_urls }}"
-          
-          SIMPLE_URLS=""
-          COMPLEX_URLS=""
-          
-          # Process each URL
-          for url in $ALL_URLS; do
-            [ -z "$url" ] && continue
-            
-            # Check if URL is "complex" (GitHub release, tokens, very long query strings)
-            if echo "$url" | grep -qiE '(github\.com.*release.*assets|jwt=|sig=|se=|sp=|spr=|sr=|sv=|skoid=|sktid=|skt=|ske=|sks=|skv=|rsct=|rscd=)' || \
-               [ "$(echo "$url" | wc -c)" -gt 400 ]; then
-              COMPLEX_URLS="${COMPLEX_URLS}${url}"$'\n'
-              echo "COMPLEX: $url"
-            else
-              SIMPLE_URLS="${SIMPLE_URLS}${url}"$'\n'
-              echo "SIMPLE: $url"
-            fi
-          done
-          
-          # Store results
-          {
-            echo "simple_urls<<FILTER_EOF"
-            echo "$SIMPLE_URLS"
-            echo "FILTER_EOF"
-          } >> "$GITHUB_OUTPUT"
-          
-          {
-            echo "complex_urls<<FILTER_EOF"
-            echo "$COMPLEX_URLS"
-            echo "FILTER_EOF"
-          } >> "$GITHUB_OUTPUT"
-          
-          if [ -n "$SIMPLE_URLS" ]; then
-            echo "has_simple_urls=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_simple_urls=false" >> "$GITHUB_OUTPUT"
-          fi
-          
-          if [ -n "$COMPLEX_URLS" ]; then
-            echo "has_complex_urls=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_complex_urls=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ============================================================
-      # STEP 3: Download simple URLs with aria2
-      # ============================================================
-      - name: Download simple URLs with aria2
-        id: download_links
-        if: steps.filter_urls.outputs.has_simple_urls == 'true'
-        uses: ./.github/actions/download-aria2
-        with:
-          urls: ${{ steps.filter_urls.outputs.simple_urls }}
-          dest_dir: tmp_downloads
-          backup_dir: ${{ steps.setup.outputs.backup_dir }}
-
-      # ============================================================
-      # STEP 4: Browser direct download (for complex URLs or as primary)
-      # ============================================================
-      - name: Browser direct download
+      - name: Browser direct download (primary)
         id: browser_download
-        if: |
-          github.event.inputs.mode == 'browser_download' ||
-          github.event.inputs.mode == 'browser_then_download' ||
-          (github.event.inputs.mode == 'auto' && steps.browser_navigate.outputs.has_direct_urls != 'true') ||
-          (steps.filter_urls.outputs.has_complex_urls == 'true')
+        if: github.event.inputs.mode != 'extract_only'
         uses: ./.github/actions/browser-download
         with:
           url: ${{ github.event.inputs.url }}
@@ -168,7 +74,7 @@ jobs:
         if: steps.browser_download.outputs.has_browser_files == 'true'
         run: |
           echo "=========================================="
-          echo "Browser Download Results:"
+          echo "Browser Download Results (PRIMARY):"
           echo "=========================================="
           echo "Files downloaded via browser:"
           echo "${{ steps.browser_download.outputs.browser_downloaded_files }}"
@@ -178,19 +84,71 @@ jobs:
       - name: Copy browser-downloaded files to tmp_downloads
         if: steps.browser_download.outputs.has_browser_files == 'true'
         run: |
-          echo "Copying browser-downloaded files to processing directory..."
+          echo "Browser download SUCCESS - copying files..."
           mkdir -p tmp_downloads
           cp -r browser_downloads/* tmp_downloads/ 2>/dev/null || true
+          echo "HAS_ANY_FILES=true" >> "$GITHUB_ENV"
           echo "Files in tmp_downloads:"
           ls -la tmp_downloads/
 
       # ============================================================
-      # STEP 5: Process downloaded files (zip/split)
+      # STEP 2: Extract links (Fallback - only if browser download failed)
+      # ============================================================
+      - name: Navigate and extract links via browser (fallback)
+        id: browser_navigate
+        if: |
+          steps.browser_download.outputs.has_browser_files != 'true' ||
+          github.event.inputs.mode == 'browser_then_download'
+        uses: ./.github/actions/browser-download
+        with:
+          url: ${{ github.event.inputs.url }}
+          mode: extract
+
+      - name: Show extracted links (fallback)
+        if: steps.browser_navigate.outputs.has_direct_urls == 'true'
+        run: |
+          echo "=========================================="
+          echo "Browser Navigator Results (FALLBACK):"
+          echo "=========================================="
+          echo "Direct URLs found:"
+          echo "${{ steps.browser_navigate.outputs.direct_urls }}"
+          echo ""
+          echo "All candidate URLs:"
+          echo "${{ steps.browser_navigate.outputs.all_urls }}"
+
+      # ============================================================
+      # STEP 3: Download extracted links with aria2 (Fallback)
+      # ============================================================
+      - name: Download extracted links with aria2 (fallback)
+        id: download_links
+        if: |
+          steps.browser_download.outputs.has_browser_files != 'true' &&
+          (steps.browser_navigate.outputs.has_direct_urls == 'true' || steps.browser_navigate.outputs.all_urls != '')
+        uses: ./.github/actions/download-aria2
+        with:
+          urls: ${{ steps.browser_navigate.outputs.direct_urls }} ${{ steps.browser_navigate.outputs.all_urls }}
+          dest_dir: tmp_downloads
+          backup_dir: ${{ steps.setup.outputs.backup_dir }}
+
+      - name: Check aria2 download results (fallback)
+        if: |
+          steps.browser_download.outputs.has_browser_files != 'true'
+        run: |
+          if [ "${{ steps.download_links.outputs.has_files }}" = "true" ]; then
+            echo "aria2 download SUCCESS"
+            echo "HAS_ANY_FILES=true" >> "$GITHUB_ENV"
+            echo "Files in tmp_downloads:"
+            ls -la tmp_downloads/
+          else
+            echo "aria2 download FAILED - no files downloaded"
+            echo "HAS_ANY_FILES=false" >> "$GITHUB_ENV"
+          fi
+
+      # ============================================================
+      # STEP 4: Process downloaded files (zip/split)
       # ============================================================
       - name: Process downloads
-        if: |
-          (steps.download_links.outputs.has_files == 'true') ||
-          (steps.browser_download.outputs.has_browser_files == 'true')
+        if: env.HAS_ANY_FILES == 'true'
         shell: bash
         run: |
           source ./.github/scripts/utils/random-name.sh
@@ -206,8 +164,12 @@ jobs:
           SPLIT_THRESHOLD_MB="${{ env.SPLIT_THRESHOLD_MB }}"
           SPLIT_THRESHOLD_BYTES=$((SPLIT_THRESHOLD_MB * 1024 * 1024))
           
-          echo "Processing files in tmp_downloads..."
+          echo "=========================================="
+          echo "Processing downloaded files..."
+          echo "=========================================="
           ls -la tmp_downloads/ 2>/dev/null || echo "tmp_downloads is empty"
+          
+          PROCESSED_COUNT=0
           
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
@@ -220,13 +182,14 @@ jobs:
             BASENAME_NO_EXT="${BASENAME%.*}"
             EXT="${BASENAME##*.}"
             
+            echo ""
             echo "Processing: $BASENAME (${SIZE} bytes)"
             
             FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BACKUP_DIR" "$BASENAME_NO_EXT")
             mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
             
             if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
-              echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting"
+              echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting into ${SPLIT_THRESHOLD_MB}MB parts"
               
               TEMP_NAME="file_$$"
               cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
@@ -238,6 +201,7 @@ jobs:
                 [ -f "$part" ] && [ -s "$part" ] || continue
                 PART_EXT="${part##*.}"
                 mv "$part" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.${PART_EXT}"
+                echo "  Created part: ${FOLDER_NAME}.${PART_EXT}"
               done
               rm -f "${TEMP_NAME}.${EXT}"
               cd - > /dev/null
@@ -324,15 +288,22 @@ jobs:
               } > "$BACKUP_DIR/${FOLDER_NAME}/README.md"
             fi
             
-            echo "Created: $BACKUP_DIR/$FOLDER_NAME/"
+            PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+            echo "Done: $BACKUP_DIR/$FOLDER_NAME/"
           done
+          
+          echo ""
+          echo "=========================================="
+          echo "Processed $PROCESSED_COUNT file(s)"
+          echo "=========================================="
           
           rm -rf tmp_downloads browser_downloads
 
       # ============================================================
-      # STEP 6: Update README and push
+      # STEP 5: Update README and push
       # ============================================================
       - name: Update README files
+        if: env.HAS_ANY_FILES == 'true'
         shell: bash
         run: |
           BACKUP_DIR="${{ steps.setup.outputs.backup_dir }}"
@@ -394,8 +365,23 @@ jobs:
           } >> README.md
 
       - name: Commit and push
+        if: env.HAS_ANY_FILES == 'true'
         uses: ./.github/actions/git-push-batch
         with:
           backup_dir: ${{ steps.setup.outputs.backup_dir }}
           branch: ${{ steps.setup.outputs.branch }}
           batch_size: '3'
+
+      - name: No files downloaded
+        if: env.HAS_ANY_FILES != 'true'
+        run: |
+          echo "=========================================="
+          echo "ERROR: No files were downloaded!"
+          echo "=========================================="
+          echo ""
+          echo "Both methods failed:"
+          echo "  1. Browser direct download: FAILED"
+          echo "  2. Link extraction + aria2: FAILED"
+          echo ""
+          echo "Please check the URL and try again."
+          exit 1
