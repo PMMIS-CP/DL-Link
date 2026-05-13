@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to visit'
+        description: 'URL to extract download links from (supports anti-bot/JS-rendered pages)'
         required: true
         type: string
 
@@ -14,187 +14,83 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install system dependencies
+      - name: Configure Git
+        uses: ./.github/actions/git-config
+        with:
+          user_name: 'github-actions'
+          user_email: 'github-actions@github.com'
+          large_file_config: 'false'
+
+      - name: Setup environment
+        id: setup
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl zip
+          BACKUP_DIR="/tmp/download_backup_browser_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "backup_dir=$BACKUP_DIR" >> "$GITHUB_OUTPUT"
+          echo "BACKUP_DIR: $BACKUP_DIR"
 
-      - name: Setup Node and Puppeteer
-        run: |
-          npm init -y
-          npm install puppeteer
+      - name: Extract links via browser
+        id: browser
+        uses: ./.github/actions/browser-download
+        with:
+          url: ${{ github.event.inputs.url }}
 
-      - name: Create browser download script
-        run: |
-          cat > download-file.js << 'ENDOFSCRIPT'
-          const puppeteer = require('puppeteer');
-          const path = require('path');
-          const fs = require('fs');
+      - name: Download extracted URLs with aria2
+        if: steps.browser.outputs.has_extracted_urls == 'true'
+        uses: ./.github/actions/download-aria2
+        with:
+          urls: ${{ steps.browser.outputs.extracted_urls }}
+          dest_dir: tmp_downloads
+          backup_dir: ${{ steps.setup.outputs.backup_dir }}
 
-          const url = process.argv[2];
-          const downloadPath = process.argv[3] || './downloads';
-          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-          (async () => {
-            if (!fs.existsSync(downloadPath)) {
-              fs.mkdirSync(downloadPath, { recursive: true });
-            }
-
-            console.log(`Target URL: ${url}`);
-            console.log(`Download directory: ${downloadPath}`);
-
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process'
-              ]
-            });
-
-            let downloadedFiles = [];
-
-            try {
-              const page = await browser.newPage();
-              const client = await page.target().createCDPSession();
-              await client.send('Page.setDownloadBehavior', {
-                behavior: 'allow',
-                downloadPath: downloadPath
-              });
-
-              await page.setUserAgent(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-              );
-
-              await page.setViewport({ width: 1366, height: 768 });
-
-              page.on('response', async (response) => {
-                const contentDisposition = response.headers()['content-disposition'] || '';
-                const contentType = response.headers()['content-type'] || '';
-                if (contentDisposition.includes('attachment') || contentType.includes('application/zip') || contentType.includes('application/octet-stream')) {
-                  console.log(`Download detected: ${response.url()}`);
-                }
-              });
-
-              console.log('Navigating to page...');
-              await page.goto(url, {
-                waitUntil: 'networkidle2',
-                timeout: 60000
-              });
-
-              console.log('Page loaded successfully.');
-
-              const downloadSelector = await page.evaluate(() => {
-                const keywords = ['download', 'setup', 'driver', '64bit', '.zip', 'graphics'];
-                const allLinks = Array.from(document.querySelectorAll('a[href]'));
-                const candidates = allLinks.filter(link => {
-                  const href = link.href.toLowerCase();
-                  const text = (link.innerText || link.textContent || '').toLowerCase();
-                  return keywords.some(kw => href.includes(kw) || text.includes(kw));
-                });
-                return candidates.length > 0 ? candidates[0].href : null;
-              });
-
-              if (downloadSelector) {
-                console.log(`Found download link: ${downloadSelector}`);
-                await page.evaluate((linkHref) => {
-                  const link = document.querySelector(`a[href="${linkHref}"]`);
-                  if (link) link.click();
-                }, downloadSelector);
-              } else {
-                console.log('No specific download link found. Listing all links:');
-                const allLinks = await page.evaluate(() =>
-                  Array.from(document.querySelectorAll('a[href]')).map(a => ({ href: a.href, text: a.innerText.substring(0, 50) }))
-                );
-                console.log(JSON.stringify(allLinks, null, 2));
-                console.log('Trying fallback: waiting for potential auto-download...');
-                await sleep(15000);
-              }
-
-              console.log('Waiting for downloads to complete...');
-              let waitTime = 0;
-              const maxWaitTime = 120000;
-
-              while (waitTime < maxWaitTime) {
-                const files = fs.readdirSync(downloadPath).filter(f => !f.endsWith('.crdownload'));
-                const newFiles = files.filter(f => !downloadedFiles.includes(f));
-
-                if (newFiles.length > 0) {
-                  downloadedFiles = files;
-                  console.log(`New files detected: ${newFiles.join(', ')}`);
-                }
-
-                const hasValidFile = files.some(f => /\.(zip|exe|msi|tar\.gz|rar|7z|dmg)$/i.test(f));
-                const noTempFiles = !files.some(f => f.endsWith('.crdownload'));
-
-                if (hasValidFile && noTempFiles) {
-                  console.log('Download completed successfully!');
-                  break;
-                }
-
-                await sleep(2000);
-                waitTime += 2000;
-              }
-
-              if (waitTime >= maxWaitTime) {
-                console.warn('Download timed out, but will proceed with any collected files.');
-              }
-
-            } catch (error) {
-              console.error('An error occurred during browser operation:', error.message);
-              process.exit(1);
-            } finally {
-              await browser.close();
-              console.log('Browser closed.');
-            }
-
-            const finalFiles = fs.readdirSync(downloadPath).filter(f => !f.endsWith('.crdownload'));
-            if (finalFiles.length === 0) {
-              console.error('No files were downloaded.');
-              process.exit(1);
-            } else {
-              console.log('Downloaded files:');
-              finalFiles.forEach(f => {
-                const filePath = path.join(downloadPath, f);
-                const stats = fs.statSync(filePath);
-                console.log(`- ${f} (${(stats.size / 1024).toFixed(2)} KB)`);
-              });
-            }
-          })();
-          ENDOFSCRIPT
-
-      - name: Download file via browser
-        run: |
-          DOWNLOAD_DIR="${{ github.workspace }}/browser_downloads"
-          mkdir -p "$DOWNLOAD_DIR"
-          node download-file.js "${{ github.event.inputs.url }}" "$DOWNLOAD_DIR"
-          if [ "$(ls -A $DOWNLOAD_DIR 2>/dev/null)" ]; then
-            echo "Files downloaded successfully:"
-            ls -la "$DOWNLOAD_DIR"
-            echo "HAS_FILES=true" >> $GITHUB_ENV
-          else
-            echo "No files were downloaded by the browser."
-            echo "HAS_FILES=false" >> $GITHUB_ENV
-          fi
-
-      - name: Commit and push downloaded files
-        if: env.HAS_FILES == 'true'
+      - name: Copy browser-downloaded files
+        if: steps.browser.outputs.has_files == 'true'
         run: |
           mkdir -p downloads/browser
-          cp -r browser_downloads/* downloads/browser/
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add downloads/browser/
+          cp -r browser_downloads/* downloads/browser/ 2>/dev/null || true
+          echo "Browser files copied to downloads/browser/"
+
+      - name: Commit and push
+        if: |
+          steps.browser.outputs.has_files == 'true' ||
+          steps.browser.outputs.has_extracted_urls == 'true'
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git add downloads/ README.md 2>/dev/null || true
+          
           if git diff --staged --quiet; then
             echo "Nothing to commit"
             exit 0
           fi
-          git commit -m "Add files downloaded via browser [skip ci]"
-          git pull --rebase
-          git push
+          
+          git commit -m "[Browser] Add files from URL extraction [skip ci]"
+          
+          # Pull with rebase, fallback to merge
+          git pull --rebase origin "$BRANCH" 2>/dev/null || {
+            echo "Rebase failed, trying merge..."
+            git fetch origin "$BRANCH"
+            git merge origin/"$BRANCH" --no-edit 2>/dev/null || true
+          }
+          
+          # Push with retry
+          PUSH_RETRY=0
+          MAX_RETRIES=5
+          while [ $PUSH_RETRY -lt $MAX_RETRIES ]; do
+            PUSH_RETRY=$((PUSH_RETRY + 1))
+            if timeout 120 git push origin HEAD:"$BRANCH" 2>&1; then
+              echo "✓ Pushed successfully!"
+              exit 0
+            fi
+            echo "Push failed, retry $PUSH_RETRY/$MAX_RETRIES..."
+            sleep $((2 + RANDOM % 5))
+            git fetch origin "$BRANCH" --quiet
+            git reset --hard origin/"$BRANCH" 2>/dev/null || true
+          done
+          
+          echo "⚠ Push failed after $MAX_RETRIES attempts"

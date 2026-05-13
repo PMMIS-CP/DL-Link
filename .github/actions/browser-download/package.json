@@ -1,0 +1,26 @@
+{
+  "name": "browser-link-extractor",
+  "version": "1.0.0",
+  "description": "Puppeteer-based link extractor - extracts direct download URLs from protected/JS-rendered pages for use with aria2/curl",
+  "main": "src/downloader.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/downloader.js",
+    "extract": "node src/downloader.js --output-format json"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "puppeteer",
+    "link-extractor",
+    "anti-bot",
+    "download-helper",
+    "github-actions"
+  ],
+  "license": "MIT",
+  "private": true
+}

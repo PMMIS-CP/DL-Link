@@ -1,0 +1,105 @@
+name: 'Browser Link Extractor'
+description: 'Extracts direct download links from pages with anti-bot protection or JavaScript-rendered content'
+
+inputs:
+  url:
+    description: 'URL to visit and extract download link from'
+    required: true
+  download_dir:
+    description: 'Temporary directory for any files downloaded during browsing'
+    required: false
+    default: './browser_downloads'
+  viewport_width:
+    description: 'Browser viewport width'
+    required: false
+    default: '1366'
+  viewport_height:
+    description: 'Browser viewport height'
+    required: false
+    default: '768'
+  navigation_timeout:
+    description: 'Page navigation timeout in ms'
+    required: false
+    default: '60000'
+  download_wait_timeout:
+    description: 'Max wait time for downloads in ms'
+    required: false
+    default: '120000'
+  user_agent:
+    description: 'Custom user agent string'
+    required: false
+    default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+outputs:
+  has_files:
+    description: 'Whether any files were downloaded directly by the browser'
+    value: ${{ steps.browser-extract.outputs.has_files }}
+  download_dir:
+    description: 'Path to any files downloaded directly by browser'
+    value: ${{ steps.browser-extract.outputs.download_dir }}
+  extracted_urls:
+    description: 'Space-separated list of extracted direct download URLs (for use with download-aria2)'
+    value: ${{ steps.browser-extract.outputs.extracted_urls }}
+  has_extracted_urls:
+    description: 'Whether any extractable URLs were found'
+    value: ${{ steps.browser-extract.outputs.has_extracted_urls }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl zip
+
+    - name: Setup Node.js and Puppeteer
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}"
+        npm install --production
+
+    - name: Extract download links via browser
+      id: browser-extract
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_DOWNLOAD_DIR: ${{ inputs.download_dir }}
+        INPUT_VIEWPORT_WIDTH: ${{ inputs.viewport_width }}
+        INPUT_VIEWPORT_HEIGHT: ${{ inputs.viewport_height }}
+        INPUT_NAVIGATION_TIMEOUT: ${{ inputs.navigation_timeout }}
+        INPUT_DOWNLOAD_WAIT_TIMEOUT: ${{ inputs.download_wait_timeout }}
+        INPUT_USER_AGENT: ${{ inputs.user_agent }}
+      run: |
+        DOWNLOAD_DIR="${{ inputs.download_dir }}"
+        mkdir -p "$DOWNLOAD_DIR"
+        
+        # Run browser link extractor - outputs JSON with results
+        RESULT=$(node "${{ github.action_path }}/src/downloader.js" \
+          --url "${{ inputs.url }}" \
+          --download-dir "$DOWNLOAD_DIR" \
+          --viewport-width "${{ inputs.viewport_width }}" \
+          --viewport-height "${{ inputs.viewport_height }}" \
+          --navigation-timeout "${{ inputs.navigation_timeout }}" \
+          --download-wait-timeout "${{ inputs.download_wait_timeout }}" \
+          --user-agent "${{ inputs.user_agent }}" \
+          --output-format json)
+        
+        echo "Browser extraction result:"
+        echo "$RESULT" | python3 -m json.tool 2>/dev/null || echo "$RESULT"
+        
+        # Parse JSON result
+        HAS_FILES=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('downloadedFiles',0)>0 else 'false')")
+        HAS_EXTRACTED=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('extractedUrls','') else 'false')")
+        EXTRACTED_URLS=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('extractedUrls',''))")
+        
+        echo "has_files=$HAS_FILES" >> "$GITHUB_OUTPUT"
+        echo "download_dir=$DOWNLOAD_DIR" >> "$GITHUB_OUTPUT"
+        echo "extracted_urls=$EXTRACTED_URLS" >> "$GITHUB_OUTPUT"
+        echo "has_extracted_urls=$HAS_EXTRACTED" >> "$GITHUB_OUTPUT"
+        
+        # Also save extracted URLs to file for cross-step use
+        if [ -n "$EXTRACTED_URLS" ]; then
+          echo "$EXTRACTED_URLS" > /tmp/extracted_urls.txt
+          echo "Extracted URLs saved to /tmp/extracted_urls.txt"
+        fi
