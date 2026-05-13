@@ -55,7 +55,9 @@ jobs:
           echo "REPO_NAME=${{ github.event.repository.name }}" >> "$GITHUB_ENV"
           echo "SPLIT_THRESHOLD_MB=45" >> "$GITHUB_ENV"
           
-          # Use outputs instead of env for values needed in 'uses' context
+          # هم env ست کن (برای stepهای run) هم output (برای stepهای uses)
+          echo "BACKUP_DIR=$BACKUP_DIR" >> "$GITHUB_ENV"
+          echo "BRANCH=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           echo "backup_dir=$BACKUP_DIR" >> "$GITHUB_OUTPUT"
           echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           
