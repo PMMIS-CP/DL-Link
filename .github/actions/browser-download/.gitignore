@@ -1,3 +1,18 @@
+# Node modules
 node_modules/
+
+# Puppeteer browser download
+.chromium/
+.local-chromium/
+
+# Log files
 *.log
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Temp files
+/tmp/
+*.tmp
+*.crdownload

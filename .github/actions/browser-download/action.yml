@@ -1,105 +1,178 @@
-name: 'Browser Link Extractor'
-description: 'Extracts direct download links from pages with anti-bot protection or JavaScript-rendered content'
+name: 'Browser Navigator'
+description: 'Puppeteer-based browser simulator for navigating complex pages and extracting direct download links'
 
 inputs:
   url:
-    description: 'URL to visit and extract download link from'
+    description: 'URL to navigate to'
     required: true
-  download_dir:
-    description: 'Temporary directory for any files downloaded during browsing'
+  mode:
+    description: 'Operation mode: extract (get direct links) or download (browser-based download)'
+    required: false
+    default: 'extract'
+  download_path:
+    description: 'Path for downloaded files (only used in download mode)'
     required: false
     default: './browser_downloads'
-  viewport_width:
-    description: 'Browser viewport width'
+  node_version:
+    description: 'Node.js version'
     required: false
-    default: '1366'
-  viewport_height:
-    description: 'Browser viewport height'
-    required: false
-    default: '768'
-  navigation_timeout:
-    description: 'Page navigation timeout in ms'
-    required: false
-    default: '60000'
-  download_wait_timeout:
-    description: 'Max wait time for downloads in ms'
-    required: false
-    default: '120000'
-  user_agent:
-    description: 'Custom user agent string'
-    required: false
-    default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    default: '18'
 
 outputs:
-  has_files:
-    description: 'Whether any files were downloaded directly by the browser'
-    value: ${{ steps.browser-extract.outputs.has_files }}
-  download_dir:
-    description: 'Path to any files downloaded directly by browser'
-    value: ${{ steps.browser-extract.outputs.download_dir }}
-  extracted_urls:
-    description: 'Space-separated list of extracted direct download URLs (for use with download-aria2)'
-    value: ${{ steps.browser-extract.outputs.extracted_urls }}
-  has_extracted_urls:
-    description: 'Whether any extractable URLs were found'
-    value: ${{ steps.browser-extract.outputs.has_extracted_urls }}
+  direct_urls:
+    description: 'Newline-separated list of direct download URLs found'
+    value: ${{ steps.navigate.outputs.direct_urls }}
+  all_urls:
+    description: 'Newline-separated list of all candidate URLs'
+    value: ${{ steps.navigate.outputs.all_urls }}
+  has_direct_urls:
+    description: 'Whether direct download URLs were found'
+    value: ${{ steps.navigate.outputs.has_direct_urls }}
+  browser_downloaded_files:
+    description: 'List of files downloaded via browser'
+    value: ${{ steps.navigate.outputs.browser_downloaded_files }}
+  has_browser_files:
+    description: 'Whether files were downloaded via browser'
+    value: ${{ steps.navigate.outputs.has_browser_files }}
+  result_json:
+    description: 'Full result as JSON'
+    value: ${{ steps.navigate.outputs.result_json }}
 
 runs:
   using: composite
   steps:
-    - name: Install system dependencies
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install dependencies
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y curl zip
+        cd "${{ github.action_path }}/src"
+        if [ -f "package.json" ]; then
+          npm install --production
+        else
+          npm init -y --quiet
+          npm install puppeteer
+        fi
+        echo "Puppeteer and dependencies installed"
 
-    - name: Setup Node.js and Puppeteer
-      shell: bash
-      run: |
-        cd "${{ github.action_path }}"
-        npm install --production
-
-    - name: Extract download links via browser
-      id: browser-extract
+    - name: Navigate and extract/download
+      id: navigate
       shell: bash
       env:
-        INPUT_URL: ${{ inputs.url }}
-        INPUT_DOWNLOAD_DIR: ${{ inputs.download_dir }}
-        INPUT_VIEWPORT_WIDTH: ${{ inputs.viewport_width }}
-        INPUT_VIEWPORT_HEIGHT: ${{ inputs.viewport_height }}
-        INPUT_NAVIGATION_TIMEOUT: ${{ inputs.navigation_timeout }}
-        INPUT_DOWNLOAD_WAIT_TIMEOUT: ${{ inputs.download_wait_timeout }}
-        INPUT_USER_AGENT: ${{ inputs.user_agent }}
+        NAVIGATOR_URL: ${{ inputs.url }}
+        NAVIGATOR_MODE: ${{ inputs.mode }}
+        NAVIGATOR_DOWNLOAD_PATH: ${{ inputs.download_path }}
+        PARSE_SCRIPT: ${{ github.action_path }}/scripts/parse-result.py
+        PARSE_DOWNLOAD_SCRIPT: ${{ github.action_path }}/scripts/parse-download-result.py
       run: |
-        DOWNLOAD_DIR="${{ inputs.download_dir }}"
-        mkdir -p "$DOWNLOAD_DIR"
+        NAVIGATOR_SCRIPT="${{ github.action_path }}/src/navigator.js"
+        PARSE_SCRIPT="$PARSE_SCRIPT"
+        PARSE_DOWNLOAD_SCRIPT="$PARSE_DOWNLOAD_SCRIPT"
         
-        # Run browser link extractor - outputs JSON with results
-        RESULT=$(node "${{ github.action_path }}/src/downloader.js" \
-          --url "${{ inputs.url }}" \
-          --download-dir "$DOWNLOAD_DIR" \
-          --viewport-width "${{ inputs.viewport_width }}" \
-          --viewport-height "${{ inputs.viewport_height }}" \
-          --navigation-timeout "${{ inputs.navigation_timeout }}" \
-          --download-wait-timeout "${{ inputs.download_wait_timeout }}" \
-          --user-agent "${{ inputs.user_agent }}" \
-          --output-format json)
+        echo "=========================================="
+        echo "Browser Navigator"
+        echo "URL: $NAVIGATOR_URL"
+        echo "Mode: $NAVIGATOR_MODE"
+        echo "=========================================="
         
-        echo "Browser extraction result:"
-        echo "$RESULT" | python3 -m json.tool 2>/dev/null || echo "$RESULT"
+        if [ "$NAVIGATOR_MODE" = "extract" ]; then
         
-        # Parse JSON result
-        HAS_FILES=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('downloadedFiles',0)>0 else 'false')")
-        HAS_EXTRACTED=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print('true' if d.get('extractedUrls','') else 'false')")
-        EXTRACTED_URLS=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('extractedUrls',''))")
+          # Run navigator in extract mode
+          node "$NAVIGATOR_SCRIPT" "$NAVIGATOR_URL" --extract-links > /tmp/navigator_output.txt 2>&1
+          NAVIGATOR_EXIT=$?
+          
+          # Parse the JSON result from marked section
+          RESULT_JSON=$(sed -n '/^__NAVIGATOR_RESULT__$/,/^__END_NAVIGATOR_RESULT__$/{//!p}' /tmp/navigator_output.txt)
+          
+          # Show full output for logs
+          cat /tmp/navigator_output.txt
+          
+          if [ -n "$RESULT_JSON" ]; then
         
-        echo "has_files=$HAS_FILES" >> "$GITHUB_OUTPUT"
-        echo "download_dir=$DOWNLOAD_DIR" >> "$GITHUB_OUTPUT"
-        echo "extracted_urls=$EXTRACTED_URLS" >> "$GITHUB_OUTPUT"
-        echo "has_extracted_urls=$HAS_EXTRACTED" >> "$GITHUB_OUTPUT"
+            # Use Python script to parse JSON and extract URLs
+            DIRECT_URLS=$(echo "$RESULT_JSON" | python3 "$PARSE_SCRIPT" direct_urls 2>/dev/null)
+            ALL_URLS=$(echo "$RESULT_JSON" | python3 "$PARSE_SCRIPT" extracted_links 2>/dev/null)
+            HEADER_URLS=$(echo "$RESULT_JSON" | python3 "$PARSE_SCRIPT" header_urls 2>/dev/null)
+            HAS_DIRECT=$(echo "$RESULT_JSON" | python3 "$PARSE_SCRIPT" has_direct 2>/dev/null)
         
-        # Also save extracted URLs to file for cross-step use
-        if [ -n "$EXTRACTED_URLS" ]; then
-          echo "$EXTRACTED_URLS" > /tmp/extracted_urls.txt
-          echo "Extracted URLs saved to /tmp/extracted_urls.txt"
+            # Merge all unique URLs
+            ALL_FOUND_URLS=$(printf '%s\n%s\n%s' "$DIRECT_URLS" "$ALL_URLS" "$HEADER_URLS" | grep -v '^$' | sort -u)
+        
+            # Set outputs
+            echo "has_direct_urls=$HAS_DIRECT" >> "$GITHUB_OUTPUT"
+        
+            {
+              echo "direct_urls<<NAV_EOF"
+              echo "$DIRECT_URLS"
+              echo "NAV_EOF"
+            } >> "$GITHUB_OUTPUT"
+        
+            {
+              echo "all_urls<<NAV_EOF"
+              echo "$ALL_FOUND_URLS"
+              echo "NAV_EOF"
+            } >> "$GITHUB_OUTPUT"
+        
+            {
+              echo "result_json<<NAV_EOF"
+              echo "$RESULT_JSON"
+              echo "NAV_EOF"
+            } >> "$GITHUB_OUTPUT"
+        
+          else
+            echo "has_direct_urls=false" >> "$GITHUB_OUTPUT"
+            echo "direct_urls=" >> "$GITHUB_OUTPUT"
+            echo "all_urls=" >> "$GITHUB_OUTPUT"
+          fi
+        
+        elif [ "$NAVIGATOR_MODE" = "download" ]; then
+        
+          # Create download directory
+          mkdir -p "$NAVIGATOR_DOWNLOAD_PATH"
+        
+          # Run navigator in download mode
+          node "$NAVIGATOR_SCRIPT" "$NAVIGATOR_URL" --download "$NAVIGATOR_DOWNLOAD_PATH" > /tmp/navigator_output.txt 2>&1
+          NAVIGATOR_EXIT=$?
+        
+          # Show full output for logs
+          cat /tmp/navigator_output.txt
+        
+          # Parse download result
+          RESULT_JSON=$(sed -n '/^__NAVIGATOR_RESULT__$/,/^__END_NAVIGATOR_RESULT__$/{//!p}' /tmp/navigator_output.txt)
+        
+          # Check for downloaded files on disk
+          if [ -d "$NAVIGATOR_DOWNLOAD_PATH" ] && [ "$(ls -A "$NAVIGATOR_DOWNLOAD_PATH" 2>/dev/null)" ]; then
+            echo "has_browser_files=true" >> "$GITHUB_OUTPUT"
+        
+            # Get file list
+            FILE_LIST=$(ls -1 "$NAVIGATOR_DOWNLOAD_PATH" 2>/dev/null)
+        
+            {
+              echo "browser_downloaded_files<<NAV_EOF"
+              echo "$FILE_LIST"
+              echo "NAV_EOF"
+            } >> "$GITHUB_OUTPUT"
+        
+          else
+            echo "has_browser_files=false" >> "$GITHUB_OUTPUT"
+            echo "browser_downloaded_files=" >> "$GITHUB_OUTPUT"
+          fi
+        
+          # Also output result_json if available
+          if [ -n "$RESULT_JSON" ]; then
+            {
+              echo "result_json<<NAV_EOF"
+              echo "$RESULT_JSON"
+              echo "NAV_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+        
+        fi
+        
+        # Log warning if navigator had non-zero exit
+        if [ "$NAVIGATOR_EXIT" != "0" ]; then
+          echo "WARNING: Navigator exited with code $NAVIGATOR_EXIT (this may be OK for partial results)"
         fi

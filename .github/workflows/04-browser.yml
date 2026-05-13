@@ -4,9 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to extract download links from (supports anti-bot/JS-rendered pages)'
+        description: 'URL to visit (supports complex pages, redirects, anti-bot)'
         required: true
         type: string
+      mode:
+        description: 'Operation mode'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - extract_only
+          - browser_download
+          - browser_then_download
 
 jobs:
   browse:
@@ -18,79 +28,299 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Configure Git
         uses: ./.github/actions/git-config
         with:
-          user_name: 'github-actions'
-          user_email: 'github-actions@github.com'
           large_file_config: 'false'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl zip bc aria2
 
       - name: Setup environment
         id: setup
         run: |
-          BACKUP_DIR="/tmp/download_backup_browser_$$"
+          BACKUP_DIR="/tmp/browser_backup_$$"
           mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+          
+          echo "REPO_OWNER=${{ github.repository_owner }}" >> "$GITHUB_ENV"
+          echo "REPO_NAME=${{ github.event.repository.name }}" >> "$GITHUB_ENV"
+          echo "BRANCH=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "BACKUP_DIR=$BACKUP_DIR" >> "$GITHUB_ENV"
+          echo "SPLIT_THRESHOLD_MB=45" >> "$GITHUB_ENV"
+          
+          # Set as step outputs for use in 'with' parameters
           echo "backup_dir=$BACKUP_DIR" >> "$GITHUB_OUTPUT"
-          echo "BACKUP_DIR: $BACKUP_DIR"
+          echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          
+          mkdir -p downloads
 
-      - name: Extract links via browser
-        id: browser
+      # ============================================================
+      # STEP 1: Browser Navigator - Extract direct links
+      # ============================================================
+      - name: Navigate and extract links via browser
+        id: browser_navigate
         uses: ./.github/actions/browser-download
         with:
           url: ${{ github.event.inputs.url }}
+          mode: extract
 
-      - name: Download extracted URLs with aria2
-        if: steps.browser.outputs.has_extracted_urls == 'true'
+      - name: Show extracted links
+        run: |
+          echo "=========================================="
+          echo "Browser Navigator Results:"
+          echo "=========================================="
+          echo "Direct URLs found: ${{ steps.browser_navigate.outputs.has_direct_urls }}"
+          if [ "${{ steps.browser_navigate.outputs.has_direct_urls }}" = "true" ]; then
+            echo ""
+            echo "Direct download links:"
+            echo "${{ steps.browser_navigate.outputs.direct_urls }}"
+          fi
+          echo ""
+          echo "All candidate URLs:"
+          echo "${{ steps.browser_navigate.outputs.all_urls }}"
+
+      # ============================================================
+      # STEP 2: Download extracted links using aria2 downloader
+      # ============================================================
+      - name: Download extracted links
+        id: download_links
+        if: steps.browser_navigate.outputs.has_direct_urls == 'true' || steps.browser_navigate.outputs.all_urls != ''
         uses: ./.github/actions/download-aria2
         with:
-          urls: ${{ steps.browser.outputs.extracted_urls }}
+          urls: ${{ steps.browser_navigate.outputs.direct_urls }} ${{ steps.browser_navigate.outputs.all_urls }}
           dest_dir: tmp_downloads
           backup_dir: ${{ steps.setup.outputs.backup_dir }}
 
-      - name: Copy browser-downloaded files
-        if: steps.browser.outputs.has_files == 'true'
-        run: |
-          mkdir -p downloads/browser
-          cp -r browser_downloads/* downloads/browser/ 2>/dev/null || true
-          echo "Browser files copied to downloads/browser/"
-
-      - name: Commit and push
+      # ============================================================
+      # STEP 3: Fallback - Browser-based direct download
+      # ============================================================
+      - name: Browser direct download (fallback)
+        id: browser_download
         if: |
-          steps.browser.outputs.has_files == 'true' ||
-          steps.browser.outputs.has_extracted_urls == 'true'
-        env:
-          BRANCH: ${{ github.ref_name }}
+          (steps.download_links.outputs.has_files != 'true' && github.event.inputs.mode != 'extract_only') ||
+          github.event.inputs.mode == 'browser_download' ||
+          github.event.inputs.mode == 'browser_then_download'
+        uses: ./.github/actions/browser-download
+        with:
+          url: ${{ github.event.inputs.url }}
+          mode: download
+          download_path: ${{ github.workspace }}/browser_downloads
+
+      - name: Copy browser-downloaded files
+        if: steps.browser_download.outputs.has_browser_files == 'true'
         run: |
-          git add downloads/ README.md 2>/dev/null || true
+          echo "Browser-downloaded files: ${{ steps.browser_download.outputs.browser_downloaded_files }}"
+          mkdir -p tmp_downloads
+          cp -r browser_downloads/* tmp_downloads/ 2>/dev/null || true
+          ls -la tmp_downloads/
+
+      # ============================================================
+      # STEP 4: Process downloaded files (zip/split)
+      # ============================================================
+      - name: Process downloads
+        if: |
+          (steps.download_links.outputs.has_files == 'true') ||
+          (steps.browser_download.outputs.has_browser_files == 'true')
+        shell: bash
+        run: |
+          source ./.github/scripts/utils/random-name.sh
           
-          if git diff --staged --quiet; then
-            echo "Nothing to commit"
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+          
+          SPLIT_THRESHOLD_BYTES=$((SPLIT_THRESHOLD_MB * 1024 * 1024))
+          
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            [ -s "$FILE" ] || continue
+            
+            SIZE=$(stat -c%s "$FILE")
+            [ "$SIZE" -gt 0 ] || continue
+            
+            BASENAME=$(basename "$FILE")
+            BASENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            
+            FOLDER_NAME=$(get_unique_folder "$BACKUP_DIR" "$BACKUP_DIR" "$BASENAME_NO_EXT")
+            mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+            
+            if [ "$SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+              echo "$BASENAME is $(( SIZE / 1024 / 1024 ))MB - splitting"
+              
+              TEMP_NAME="file_$$"
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+              
+              cd tmp_downloads
+              zip -0 -s "${SPLIT_THRESHOLD_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                [ -f "$part" ] && [ -s "$part" ] || continue
+                PART_EXT="${part##*.}"
+                mv "$part" "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.${PART_EXT}"
+              done
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd - > /dev/null
+              
+              # Generate split README
+              PARTS_COUNT=$(ls "$BACKUP_DIR/${FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
+              TOTAL_SIZE=0
+              for pf in "$BACKUP_DIR/${FOLDER_NAME}"/*; do
+                [ -f "$pf" ] || continue
+                PSIZE=$(stat -c%s "$pf" 2>/dev/null || echo 0)
+                TOTAL_SIZE=$((TOTAL_SIZE + PSIZE))
+              done
+              TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+              
+              FOLDER_ENCODED=$(urlencode "$FOLDER_NAME")
+              DOWNLOAD_LINKS_MD=""
+              LINK_NUM=0
+              for part_file in "$BACKUP_DIR/${FOLDER_NAME}/"*.z*; do
+                [ -f "$part_file" ] || continue
+                PART_BASENAME=$(basename "$part_file")
+                PART_ENCODED=$(urlencode "$PART_BASENAME")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${PART_ENCODED}"
+                LINK_NUM=$((LINK_NUM + 1))
+                DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+              done
+              
+              {
+                printf '%s\n' "# ${BASENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
+                printf '%s\n' "| **Total Size** | **${PARTS_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                printf '%s\n' "| **Source** | Browser Navigator |"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Links"
+                printf '%s\n' ""
+                printf '%s\n' "| # | File | Link |"
+                printf '%s\n' "|---|------|------|"
+                printf '%s' "${DOWNLOAD_LINKS_MD}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## How to Extract"
+                printf '%s\n' ""
+                printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+                printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+                printf '%s\n' "3. Open the \`.zip\` file - all parts will combine automatically"
+              } > "$BACKUP_DIR/${FOLDER_NAME}/README.md"
+            else
+              # Single file zip
+              zip -j "$BACKUP_DIR/${FOLDER_NAME}/${FOLDER_NAME}.zip" "$FILE"
+              
+              SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+              FILE_ENCODED=$(urlencode "${FOLDER_NAME}.zip")
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENCODED}"
+              
+              {
+                printf '%s\n' "# ${BASENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Original File** | \`${BASENAME}\` |"
+                printf '%s\n' "| **Size** | ${SIZE_MB} MB |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                printf '%s\n' "| **Source** | Browser Navigator |"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Link"
+                printf '%s\n' ""
+                printf '%s\n' "| File | Link |"
+                printf '%s\n' "|------|------|"
+                printf '%s\n' "| \`${FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |"
+              } > "$BACKUP_DIR/${FOLDER_NAME}/README.md"
+            fi
+          done
+          
+          rm -rf tmp_downloads browser_downloads
+
+      # ============================================================
+      # STEP 5: Update README and push
+      # ============================================================
+      - name: Update README files
+        shell: bash
+        run: |
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+          
+          mkdir -p downloads
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]; then
+            cp -r "$BACKUP_DIR"/* downloads/
+          fi
+          
+          FOLDERS=$(find downloads -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+          
+          if [ -z "$FOLDERS" ]; then
+            echo "No folders found in downloads"
             exit 0
           fi
           
-          git commit -m "[Browser] Add files from URL extraction [skip ci]"
+          {
+            echo "# Downloaded list (via Browser) :"
+            echo ""
+            echo "$FOLDERS" | while read -r FOLDER; do
+              [ -n "$FOLDER" ] || continue
+              FOLDER_ENCODED=$(urlencode "${FOLDER}")
+              echo "- [${FOLDER}](./${FOLDER_ENCODED})"
+            done
+          } > "downloads/README.md"
           
-          # Pull with rebase, fallback to merge
-          git pull --rebase origin "$BRANCH" 2>/dev/null || {
-            echo "Rebase failed, trying merge..."
-            git fetch origin "$BRANCH"
-            git merge origin/"$BRANCH" --no-edit 2>/dev/null || true
-          }
+          SECTION_TITLE="Downloaded files in your GitHub :"
           
-          # Push with retry
-          PUSH_RETRY=0
-          MAX_RETRIES=5
-          while [ $PUSH_RETRY -lt $MAX_RETRIES ]; do
-            PUSH_RETRY=$((PUSH_RETRY + 1))
-            if timeout 120 git push origin HEAD:"$BRANCH" 2>&1; then
-              echo "✓ Pushed successfully!"
-              exit 0
-            fi
-            echo "Push failed, retry $PUSH_RETRY/$MAX_RETRIES..."
-            sleep $((2 + RANDOM % 5))
-            git fetch origin "$BRANCH" --quiet
-            git reset --hard origin/"$BRANCH" 2>/dev/null || true
-          done
+          if [ ! -f "README.md" ]; then
+            echo "# Downloader" > README.md
+            echo "" >> README.md
+          fi
           
-          echo "⚠ Push failed after $MAX_RETRIES attempts"
+          if grep -q "$SECTION_TITLE" README.md 2>/dev/null; then
+            sed -i "/$SECTION_TITLE/,/^---$/d" README.md
+            sed -i '${/^$/d;}' README.md
+          fi
+          
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## $SECTION_TITLE"
+            echo ""
+            COUNTER=1
+            echo "$FOLDERS" | while read -r FOLDER; do
+              [ -n "$FOLDER" ] || continue
+              FOLDER_ENCODED=$(urlencode "${FOLDER}")
+              echo "${COUNTER}. [${FOLDER}](${REPO_URL}/${FOLDER_ENCODED})"
+              echo ""
+              COUNTER=$((COUNTER + 1))
+            done
+            echo "---"
+          } >> README.md
+
+      - name: Commit and push
+        uses: ./.github/actions/git-push-batch
+        with:
+          backup_dir: ${{ steps.setup.outputs.backup_dir }}
+          branch: ${{ steps.setup.outputs.branch }}
+          batch_size: '3'
